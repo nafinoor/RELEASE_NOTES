@@ -7,10 +7,40 @@ from flask_cors import CORS, cross_origin
 import logging
 import queue
 import threading
+from pymongo import MongoClient
 
 load_dotenv()
 
 from release_note_generator import run_generator, get_week_range
+
+app = Flask(__name__)
+
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MONGO_DB = os.environ.get("MONGO_DB", "admin")
+MONGO_COLLECTION = "release_notes"
+
+mongo_client = None
+mongo_collection = None
+
+
+def get_mongo_collection():
+    global mongo_client, mongo_collection
+    if mongo_collection is None:
+        if MONGO_URI:
+            try:
+                mongo_uri = MONGO_URI.split('/?')[0] if '/?' in MONGO_URI else MONGO_URI
+                mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+                mongo_client.server_info()
+                mongo_collection = mongo_client[MONGO_DB][MONGO_COLLECTION]
+                logger.info(f"Connected to MongoDB: {MONGO_DB}.{MONGO_COLLECTION}")
+            except Exception as e:
+                logger.error(f"MongoDB connection failed: {e}")
+                mongo_client = None
+                mongo_collection = None
+        else:
+            logger.warning("MONGO_URI not set. Using file fallback.")
+    return mongo_collection
+
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
@@ -35,16 +65,7 @@ def add_cors_headers(response):
 
 
 RELEASE_NOTES_FILE = "release_notes.json"
-
 cached_notes = {}
-
-
-def save_to_file(data, filename):
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.warning(f"Could not save to file: {e}. Using in-memory cache.")
 
 
 def load_from_file(filename):
@@ -55,6 +76,60 @@ def load_from_file(filename):
     except Exception as e:
         logger.warning(f"Could not load from file: {e}. Using in-memory cache.")
     return {}
+
+
+def save_to_file(data, filename):
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Could not save to file: {e}. Using in-memory cache.")
+
+
+def load_notes():
+    col = get_mongo_collection()
+    if col is not None:
+        notes = {}
+        for doc in col.find():
+            week_key = doc.get("week_start")
+            if week_key:
+                doc_copy = doc.copy()
+                del doc_copy["_id"]
+                notes[week_key] = doc_copy
+        return notes
+    return load_from_file(RELEASE_NOTES_FILE)
+
+
+def save_notes(data):
+    col = get_mongo_collection()
+    logger.info(f"save_notes: col is {type(col)} = {col is not None}")
+    if col is not None:
+        for week_key, note_data in data.items():
+            note_data_copy = note_data.copy()
+            note_data_copy["week_start"] = week_key
+            result = col.update_one(
+                {"week_start": week_key},
+                {"$set": note_data_copy},
+                upsert=True
+            )
+            logger.info(f"Saved {week_key}: {result.upserted_id}")
+        logger.info("Saved to MongoDB")
+        return
+    logger.info("MongoDB not available, saving to file")
+    save_to_file(data, RELEASE_NOTES_FILE)
+    logger.info("Saved to file")
+    col = get_mongo_collection()
+    if col is not None:
+        for week_key, note_data in data.items():
+            note_data_copy = note_data.copy()
+            note_data_copy["week_start"] = week_key
+            col.update_one(
+                {"week_start": week_key},
+                {"$set": note_data_copy},
+                upsert=True
+            )
+        return
+    save_to_file(data, RELEASE_NOTES_FILE)
 
 
 def generate_progress():
@@ -108,9 +183,9 @@ def get_release_notes():
             "content": message
         }
         
-        all_notes = load_from_file(RELEASE_NOTES_FILE)
+        all_notes = load_notes()
         all_notes[week_key] = data
-        save_to_file(all_notes, RELEASE_NOTES_FILE)
+        save_notes(all_notes)
         logger.info(f"Saved release note to {week_key}")
         
         return jsonify(data)
@@ -123,7 +198,7 @@ def get_release_notes():
 
 @app.route('/api/release-notes/<week_start>', methods=['GET'])
 def get_release_note_by_week(week_start):
-    all_notes = load_from_file(RELEASE_NOTES_FILE)
+    all_notes = load_notes()
     
     if week_start in all_notes:
         return jsonify(all_notes[week_start])
@@ -162,9 +237,9 @@ def generate_release_notes():
             "content": message
         }
         
-        all_notes = load_from_file(RELEASE_NOTES_FILE)
+        all_notes = load_notes()
         all_notes[week_key] = result
-        save_to_file(all_notes, RELEASE_NOTES_FILE)
+        save_notes(all_notes)
         logger.info(f"Saved release note to {week_key}")
         
         return jsonify(result)
@@ -186,7 +261,7 @@ def admin_get_release_notes():
     if password != ADMIN_PASSWORD:
         return jsonify({"error": "Unauthorized"}), 401
     
-    all_notes = load_from_file(RELEASE_NOTES_FILE)
+    all_notes = load_notes()
     if not all_notes:
         week_start_dt, week_end_dt = get_week_range()
         week_key = week_start_dt.strftime('%Y-%m-%d')
@@ -213,11 +288,11 @@ def admin_update_release_note():
     if not week_start:
         return jsonify({"error": "Missing week_start"}), 400
     
-    all_notes = load_from_file(RELEASE_NOTES_FILE)
+    all_notes = load_notes()
     
     if week_start in all_notes:
         all_notes[week_start]["content"] = content
-        save_to_file(all_notes, RELEASE_NOTES_FILE)
+        save_notes(all_notes)
         return jsonify({"data": all_notes[week_start]})
     
     return jsonify({"error": "Release note not found"}), 404
@@ -256,9 +331,9 @@ def admin_generate_release_note():
         
         cached_notes[week_key] = result
         try:
-            all_notes = load_from_file(RELEASE_NOTES_FILE)
+            all_notes = load_notes()
             all_notes[week_key] = result
-            save_to_file(all_notes, RELEASE_NOTES_FILE)
+            save_notes(all_notes)
         except Exception as e:
             logger.warning(f"Could not save to file: {e}")
         
