@@ -18,6 +18,11 @@ CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+print("=== API Server Routes ===")
+for rule in app.url_map.iter_rules():
+    print(f"{rule.methods} {rule.rule}")
+print("========================")
+
 progress_queue = queue.Queue()
 
 
@@ -57,6 +62,11 @@ def generate_progress():
 @app.route('/api/health')
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route('/')
+def index():
+    return jsonify({"status": "ok", "message": "Release Notes API"})
 
 @app.route('/api/release-notes', methods=['GET'])
 def get_release_notes():
@@ -277,4 +287,5 @@ def admin_generate_release_note():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    debug = os.environ.get("DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug, use_reloader=not debug)

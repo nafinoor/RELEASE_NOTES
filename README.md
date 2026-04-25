@@ -58,7 +58,7 @@ Best for beginners - no Docker needed, Render handles everything.
    - Name: `release-notes-api`
    - Environment: `Python 3`
    - Build Command: `pip install -r requirements.txt`
-   - Start Command: `gunicorn api_server:app`
+   - Start Command: `python api_server.py`
 5. Add Environment Variables (Advanced → Add Environment Variable):
    - `GITHUB_TOKEN` = your_github_token
    - `FE_REPO` = yourorg/your-fe-repo
