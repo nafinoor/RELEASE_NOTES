@@ -36,16 +36,24 @@ def add_cors_headers(response):
 
 RELEASE_NOTES_FILE = "release_notes.json"
 
+cached_notes = {}
+
 
 def save_to_file(data, filename):
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Could not save to file: {e}. Using in-memory cache.")
 
 
 def load_from_file(filename):
-    if os.path.exists(filename):
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
+    try:
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load from file: {e}. Using in-memory cache.")
     return {}
 
 
@@ -179,6 +187,16 @@ def admin_get_release_notes():
         return jsonify({"error": "Unauthorized"}), 401
     
     all_notes = load_from_file(RELEASE_NOTES_FILE)
+    if not all_notes:
+        week_start_dt, week_end_dt = get_week_range()
+        week_key = week_start_dt.strftime('%Y-%m-%d')
+        all_notes[week_key] = {
+            "week_start": week_key,
+            "week_end": week_end_dt.strftime('%Y-%m-%d'),
+            "generated_at": datetime.now().isoformat(),
+            "content": "No release notes generated yet. Click Generate to create one."
+        }
+    
     return jsonify({"data": all_notes})
 
 
