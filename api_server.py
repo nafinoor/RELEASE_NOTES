@@ -240,67 +240,32 @@ def admin_generate_release_note():
     if not token or not fe_repo or not be_repo:
         return jsonify({"error": "Missing GitHub configuration"}), 500
     
-    import threading
-    import time
-    
-    result_container = {"data": None, "error": None}
-    
-    def run_generator_in_thread():
-        try:
-            message = run_generator(token, fe_repo, be_repo, "", llm_key, llm_url)
-            week_start_dt, week_end_dt = get_week_range()
-            week_key = week_start_dt.strftime('%Y-%m-%d')
-            
-            result_data = {
-                "week_start": week_key,
-                "week_end": week_end_dt.strftime('%Y-%m-%d'),
-                "generated_at": datetime.now().isoformat(),
-                "content": message
-            }
-            
-            all_notes = load_from_file(RELEASE_NOTES_FILE)
-            all_notes[week_key] = result_data
-            save_to_file(all_notes, RELEASE_NOTES_FILE)
-            
-            result_container["data"] = result_data
-        except Exception as e:
-            result_container["error"] = str(e)
-    
-    thread = threading.Thread(target=run_generator_in_thread)
-    thread.start()
-    
-    def generate():
-        statuses = [
-            "Connecting to GitHub...",
-            "Fetching PRs...",
-            "Processing changes...",
-            "Formatting...",
-            "Saving...",
-        ]
+    try:
+        logger.info("Starting release note generation...")
+        message = run_generator(token, fe_repo, be_repo, llm_key, llm_url)
         
-        for status in statuses:
-            if not thread.is_alive():
-                break
-            yield f"data: {json.dumps({'status': status})}\n\n"
-            time.sleep(1.5)
+        week_start_dt, week_end_dt = get_week_range()
+        week_key = week_start_dt.strftime('%Y-%m-%d')
         
-        thread.join()
-        
-        if result_container.get("error"):
-            yield f"data: {json.dumps({'status': 'error', 'error': result_container['error']})}\n\n"
-        elif result_container.get("data"):
-            yield f"data: {json.dumps({'status': 'Ready!', 'data': result_container['data']})}\n\n"
-        else:
-            yield f"data: {json.dumps({'status': 'error', 'error': 'Unknown error'})}\n\n"
-    
-    return app.response_class(
-        generate(),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
+        result = {
+            "week_start": week_key,
+            "week_end": week_end_dt.strftime('%Y-%m-%d'),
+            "generated_at": datetime.now().isoformat(),
+            "content": message
         }
-    )
+        
+        cached_notes[week_key] = result
+        try:
+            all_notes = load_from_file(RELEASE_NOTES_FILE)
+            all_notes[week_key] = result
+            save_to_file(all_notes, RELEASE_NOTES_FILE)
+        except Exception as e:
+            logger.warning(f"Could not save to file: {e}")
+        
+        return jsonify({"data": result})
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
