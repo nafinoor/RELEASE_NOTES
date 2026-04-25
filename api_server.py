@@ -223,7 +223,8 @@ def generate_release_notes():
         return jsonify({"error": "Missing required parameters"}), 400
     
     try:
-        logger.info("Starting run_generator...")
+        using_llm = bool(llm_key and llm_url)
+        logger.info(f"Starting run_generator... (LLM: {using_llm})")
         message = run_generator(token, fe_repo, be_repo, llm_key, llm_url)
         logger.info(f"Generator returned message length: {len(message)}")
         
@@ -234,7 +235,8 @@ def generate_release_notes():
             "week_start": week_key,
             "week_end": week_end_dt.strftime('%Y-%m-%d'),
             "generated_at": datetime.now().isoformat(),
-            "content": message
+            "content": message,
+            "llm_used": using_llm
         }
         
         all_notes = load_notes()
@@ -316,7 +318,11 @@ def admin_generate_release_note():
         return jsonify({"error": "Missing GitHub configuration"}), 500
     
     try:
-        logger.info("Starting release note generation...")
+        llm_key = os.environ.get("LLM_API_KEY", "")
+        llm_url = os.environ.get("LLM_API_URL", "")
+        
+        using_llm = bool(llm_key and llm_url)
+        logger.info(f"Starting release note generation... (LLM: {using_llm})")
         message = run_generator(token, fe_repo, be_repo, llm_key, llm_url)
         
         week_start_dt, week_end_dt = get_week_range()
@@ -326,7 +332,8 @@ def admin_generate_release_note():
             "week_start": week_key,
             "week_end": week_end_dt.strftime('%Y-%m-%d'),
             "generated_at": datetime.now().isoformat(),
-            "content": message
+            "content": message,
+            "llm_used": using_llm
         }
         
         cached_notes[week_key] = result
