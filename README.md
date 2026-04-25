@@ -14,6 +14,8 @@ Generates weekly release notes by aggregating merged PRs from Frontend and Backe
 | `ADMIN_PASSWORD` | Yes | Password for admin API endpoints |
 | `LLM_API_KEY` | No | OpenAI API key for AI summarization |
 | `LLM_API_URL` | No | LLM API endpoint (defaults to OpenAI) |
+| `MONGO_URI` | No | MongoDB Atlas connection string (for persistence) |
+| `MONGO_DB` | No | MongoDB database name (default: admin) |
 
 ### 2. Local Development
 
@@ -64,6 +66,9 @@ Best for beginners - no Docker needed, Render handles everything.
    - `FE_REPO` = yourorg/your-fe-repo
    - `BE_REPO` = yourorg/your-be-repo
    - `ADMIN_PASSWORD` = your_secure_password
+   - `MONGO_URI` = mongodb+srv://... (your MongoDB Atlas connection string)
+   - `MONGO_DB` = admin
+
 6. Click Create Web Service
 
 Your API will be live at: `https://release-notes-api.onrender.com`
