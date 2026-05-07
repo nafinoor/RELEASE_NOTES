@@ -66,85 +66,80 @@ def summarize_description(body: str) -> str:
     sentences = re.split(r'[.!?]+', cleaned)
     first_sentence = sentences[0].strip() if sentences else ""
 
-    first_sentence = re.sub(r'^(we have|we added|users can|now you can|should now)', '', first_sentence, flags=re.IGNORECASE).strip()
+    first_sentence = re.sub(
+        r'^(we have|we added|users can|now you can|should now)',
+        '',
+        first_sentence,
+        flags=re.IGNORECASE
+    ).strip()
     first_sentence = first_sentence[0].upper() + first_sentence[1:] if first_sentence else first_sentence
 
-    # Let LLM handle truncation naturally - don't artificially truncate
     return first_sentence
 
 
-def call_llm_summarize(text: str, llm_api_url: str, llm_api_key: str) -> Optional[str]:
+def call_llm_summarize(
+    text: str,
+    friendly_title: str,
+    llm_api_url: str,
+    llm_api_key: str,
+) -> Optional[str]:
     if not text or not llm_api_url or not llm_api_key:
         return None
 
     try:
         headers = {"api-key": llm_api_key, "Content-Type": "application/json"}
-        payload = {"model": "gpt-5.4", "messages": [{"role": "user", "content": f"""You are writing release notes for NON-TECHNICAL USERS (customers).
+        prompt = f"""Write one sentence (max 12 words) that explains WHY THIS MATTERS to a customer.
 
-CRITICAL RULES:
-- NEVER use these words: migration, script, API, backend, frontend, endpoint, PR, commit, branch, repo, database, ticket, convert, fix/, feat/, chore/
-- Write ONLY about what the USER can SEE or DO after this change
-- Keep it to 1 sentence, maximum 15 words
-- If no user-facing change exists, respond with exactly: INTERNAL
+This is the supporting line under a release note title — it should add context the title doesn't already say. Don't repeat the title. Don't start with "This" or "Now".
 
-Input: {text}
+Focus on the benefit or outcome for the user. Use plain, conversational English.
 
-Output (user-friendly, no technical jargon):"""}], "max_completion_tokens": 60}
+Banned words: API, backend, migration, script, repo, ticket, PR, endpoint, refactor, feat/, fix/, chore/, database, frontend, commit, branch.
+
+If the change has no user-visible effect (config changes, internal refactors, test updates), reply with exactly: SKIP
+
+Examples:
+Title: "Subscriptions cancel automatically" → "No more manual cleanup when a plan expires."
+Title: "Dashboard loads noticeably faster" → "Pages with large datasets open in under a second."
+Title: "Attachments copy correctly now" → "Convert a record without losing any attached files."
+
+Title: {friendly_title}
+Change: {text}
+
+Benefit sentence (no quotes):"""
+
+        payload = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": 60,
+        }
         resp = requests.post(llm_api_url, json=payload, headers=headers, timeout=15)
         if resp.status_code != 200:
             return None
 
         data = resp.json()
+        result = _extract_text_from_response(data, resp)
 
-        # Try several common response shapes
-        if isinstance(data, dict):
-            for key in ("summary", "result", "output", "text"):
-                if key in data and isinstance(data[key], str):
-                    result = data[key].strip()
-                    # Validate output - if it contains technical jargon, reject it
-                    if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket', 'fix/', 'feat/']):
-                        return None
-                    return result
+        if not result:
+            return None
 
-            # OpenAI-like
-            if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
-                c0 = data["choices"][0]
-                if isinstance(c0, dict):
-                    if "text" in c0 and isinstance(c0["text"], str):
-                        result = c0["text"].strip()
-                        if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
-                            return None
-                        return result
-                    if "message" in c0 and isinstance(c0["message"], dict):
-                        msg = c0["message"].get("content")
-                        if isinstance(msg, str):
-                            if any(word in msg.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
-                                return None
-                            return msg.strip()
+        result = result.strip()
 
-            # Some hosts return results array
-            if "results" in data and isinstance(data["results"], list) and data["results"]:
-                r0 = data["results"][0]
-                if isinstance(r0, dict):
-                    for key in ("output", "content", "text"):
-                        if key in r0 and isinstance(r0[key], str):
-                            result = r0[key].strip()
-                            if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
-                                return None
-                            return result
+        if result.upper() == "SKIP":
+            return None
 
-        # Last resort: try plain text body
-        text_body = resp.text
-        if text_body:
-            text_body = text_body.strip()
-            if any(word in text_body.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
-                return None
-            return text_body[:200]
+        banned = ['migration', 'script', 'api', 'backend', 'repo', 'ticket', 'fix/', 'feat/']
+        if any(word in result.lower() for word in banned):
+            return None
+
+        # Reject if it just echoes the title
+        if result.lower().strip('.') == friendly_title.lower().strip('.'):
+            return None
+
+        return result
 
     except Exception:
         return None
-
-    return None
 
 
 def call_llm_make_title(text: str, llm_api_url: str, llm_api_key: str) -> Optional[str]:
@@ -153,54 +148,80 @@ def call_llm_make_title(text: str, llm_api_url: str, llm_api_key: str) -> Option
 
     try:
         headers = {"api-key": llm_api_key, "Content-Type": "application/json"}
-        payload = {"model": "gpt-5.4", "messages": [{"role": "user", "content": f"""Rewrite this as a SHORT (5-8 words), user-friendly title.
-CRITICAL: Remove ALL technical terms: migration, script, ticket, fix/, feat/, chore/, API, backend, endpoint, PR, commit, branch, repo, refactor, convert.
-Focus on WHAT THE USER SEES OR CAN DO.
-Write like you're telling a regular customer what's new.
+        prompt = f"""You write release note titles for customers — not developers.
+
+Rules:
+- 5–8 words, present tense
+- Start with what the user can now DO or SEE (a verb or noun, never a prefix like "feat:" or "fix:")
+- Never use: API, backend, migration, script, repo, ticket, PR, endpoint, refactor, feat/, fix/, chore/
+- If there is no user-facing change, reply with exactly: SKIP
 
 Examples:
-- "Add migration script for subscriptions" → "Cancel expired subscriptions automatically"
-- "Fix/ticket convert copy attachments" → "Copy attachments when converting"
+"feat: add migration script for subscription expiry" → "Subscriptions now cancel automatically"
+"fix/ticket-847: convert copy attachments endpoint bug" → "Attachments copy correctly now"
+"chore: update webpack config and babel transform pipeline" → SKIP
+"enh: improve dashboard load performance via lazy loading" → "Dashboard loads noticeably faster"
 
-Text: {text}"""}], "max_completion_tokens": 40}
+Title to rewrite: {text}
+
+Output (title only, no quotes):"""
+
+        payload = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": 40,
+        }
         resp = requests.post(llm_api_url, json=payload, headers=headers, timeout=15)
         if resp.status_code != 200:
             return None
 
         data = resp.json()
+        result = _extract_text_from_response(data, resp)
 
-        # Try several common response shapes
-        if isinstance(data, dict):
-            for key in ("title", "summary", "result", "output", "text"):
-                if key in data and isinstance(data[key], str):
-                    return data[key].strip()
+        if not result:
+            return None
 
-            # OpenAI-like
-            if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
-                c0 = data["choices"][0]
-                if isinstance(c0, dict):
-                    if "text" in c0 and isinstance(c0["text"], str):
-                        return c0["text"].strip()
-                    if "message" in c0 and isinstance(c0["message"], dict):
-                        msg = c0["message"].get("content")
-                        if isinstance(msg, str):
-                            return msg.strip()
+        result = result.strip()
 
-            # Some hosts return results array
-            if "results" in data and isinstance(data["results"], list) and data["results"]:
-                r0 = data["results"][0]
-                if isinstance(r0, dict):
-                    for key in ("output", "content", "text"):
-                        if key in r0 and isinstance(r0[key], str):
-                            return r0[key].strip()
+        if result.upper() == "SKIP":
+            return None
 
-        # Last resort: try plain text body
-        text_body = resp.text
-        if text_body:
-            return text_body.strip()[:100]
+        return result
 
     except Exception:
         return None
+
+
+def _extract_text_from_response(data: dict, resp) -> Optional[str]:
+    """Extract text content from various LLM API response shapes."""
+    if isinstance(data, dict):
+        # Direct string fields
+        for key in ("title", "summary", "result", "output", "text"):
+            if key in data and isinstance(data[key], str):
+                return data[key].strip()
+
+        # OpenAI-like choices
+        if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            c0 = data["choices"][0]
+            if isinstance(c0, dict):
+                if "text" in c0 and isinstance(c0["text"], str):
+                    return c0["text"].strip()
+                if "message" in c0 and isinstance(c0["message"], dict):
+                    msg = c0["message"].get("content")
+                    if isinstance(msg, str):
+                        return msg.strip()
+
+        # Results array
+        if "results" in data and isinstance(data["results"], list) and data["results"]:
+            r0 = data["results"][0]
+            if isinstance(r0, dict):
+                for key in ("output", "content", "text"):
+                    if key in r0 and isinstance(r0[key], str):
+                        return r0[key].strip()
+
+    # Plain text fallback
+    if resp and resp.text:
+        return resp.text.strip()[:200]
 
     return None
 
@@ -221,47 +242,43 @@ def is_security_sensitive(text: str) -> bool:
     return False
 
 
-def make_user_friendly_title(title: str, llm_api_url: Optional[str] = None, llm_api_key: Optional[str] = None) -> str:
-    # Try LLM first if available
+def make_user_friendly_title(
+    title: str,
+    llm_api_url: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+) -> str:
+    # Try LLM first
     if llm_api_url and llm_api_key:
         llm_title = call_llm_make_title(title, llm_api_url, llm_api_key)
         if llm_title:
-            # Capitalize first letter if LLM didn't
-            if llm_title:
-                llm_title = llm_title[0].upper() + llm_title[1:] if llm_title else llm_title
-            return llm_title
+            return llm_title[0].upper() + llm_title[1:] if llm_title else llm_title
 
-    # Fallback: Aggressively clean the title
-    # Remove conventional commit prefixes (including common types)
-    title = re.sub(r'^(feat|fix|refactor|enh|chore|docs|style|test)(\([^)]*\))?:\s*', '', title, flags=re.IGNORECASE).strip()
+    # Fallback: regex-based cleaning
+    title = re.sub(
+        r'^(feat|fix|refactor|enh|chore|docs|style|test)(\([^)]*\))?:\s*',
+        '',
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    # Remove technical jargon that is not user-facing
     tech_patterns = [
         r'\bapi\b', r'\bendpoint\b', r'\bbackend\b', r'\bfrontend\b', r'\bpr\b',
         r'\bcommit\b', r'\bdb\b', r'\bdatabase\b', r'\brepo\b', r'\brepository\b',
         r'\bmerge\b', r'\bbranch\b', r'\bpull request\b', r'\bslack\b', r'\bwebhook\b',
-        r'\bmigration\b', r'\bscript\b', r'\bticket\b', r'\bconvert\b', r'\bcopy\b',
-        r'\bFix\b', r'\bfix/\b', r'\bfeat/\b', r'\bchore/\b'
+        r'\bmigration\b', r'\bscript\b', r'\bticket\b', r'\bconvert\b',
+        r'\bFix\b', r'\bfix/\b', r'\bfeat/\b', r'\bchore/\b',
     ]
     for pattern in tech_patterns:
         title = re.sub(pattern, '', title, flags=re.IGNORECASE)
 
-    # Remove "Add migration script for..." type patterns
     title = re.sub(r'^(add|update|fix|remove|delete|modify)\s+', '', title, flags=re.IGNORECASE)
-
-    # Clean up extra whitespace and punctuation left behind
     title = re.sub(r'\s+', ' ', title).strip()
     title = re.sub(r'^\W+|\W+$', '', title).strip()
 
-    # Capitalize first letter
     if title:
         title = title[0].upper() + title[1:]
 
-    # Fallback if title is empty after processing
-    if not title:
-        title = "App improvements and updates"
-
-    return title
+    return title or "App improvements and updates"
 
 
 def get_combined_text(title: str, body: str, commits: str) -> str:
@@ -275,13 +292,16 @@ def get_combined_text(title: str, body: str, commits: str) -> str:
     return " | ".join(parts)
 
 
-def generate_user_friendly_internal_summary(title: str) -> str:
-    return make_user_friendly_title(title)
-
-
-def generate_summary(title: str, body: str, commits: str, llm_api_url: Optional[str], llm_api_key: Optional[str]) -> str:
-    # Get the user-friendly title first
-    friendly_title = make_user_friendly_title(title, llm_api_url, llm_api_key)
+def generate_summary(
+    title: str,
+    body: str,
+    commits: str,
+    llm_api_url: Optional[str],
+    llm_api_key: Optional[str],
+    friendly_title: Optional[str] = None,
+) -> str:
+    if not friendly_title:
+        friendly_title = make_user_friendly_title(title, llm_api_url, llm_api_key)
 
     if not friendly_title or friendly_title == "App improvements and updates":
         return ""
@@ -289,96 +309,20 @@ def generate_summary(title: str, body: str, commits: str, llm_api_url: Optional[
     if is_security_sensitive(friendly_title):
         return ""
 
-    # Try LLM to generate a DIFFERENT summary sentence (not the same as title)
     if llm_api_key and llm_api_url:
-        llm_input = f"Write a ONE-SENTENCE summary (max 12 words) that is DIFFERENT from the title. Focus on the BENEFIT to users, not just repeating the title. Title: '{friendly_title}'"
-
-        remote = call_llm_summarize(llm_input, llm_api_url, llm_api_key)
-        if remote and remote.strip().upper() != "INTERNAL":
+        combined = get_combined_text(title, clean_description(body), commits)
+        remote = call_llm_summarize(combined, friendly_title, llm_api_url, llm_api_key)
+        if remote:
             remote_clean = remote.strip()
-            # Reject if it's the same as title or generic
-            if remote_clean.lower() != friendly_title.lower():
-                generic_phrases = ['now available for all users', 'now available', 'improvements and updates',
-                                'backend improvements', 'no description', 'internally updated']
-                if not is_security_sensitive(remote_clean):
-                    if not any(phrase in remote_clean.lower() for phrase in generic_phrases):
-                        return remote_clean
+            generic_phrases = [
+                'now available for all users', 'now available', 'improvements and updates',
+                'backend improvements', 'no description', 'internally updated',
+            ]
+            if not is_security_sensitive(remote_clean):
+                if not any(phrase in remote_clean.lower() for phrase in generic_phrases):
+                    return remote_clean
 
-    # Fallback: Return empty - just show the title without summary
     return ""
-
-
-def _make_benefit_from_title(title: str) -> str:
-    """Generate a benefit statement that's DIFFERENT from the title."""
-    title_lower = title.lower()
-
-    # Pattern: "Cancel X automatically" -> "No manual work needed for X"
-    if 'automatically' in title_lower:
-        # Extract what's being done automatically
-        words = title.split()
-        if 'automatically' in words:
-            idx = words.index('automatically')
-            if idx > 0:
-                action = ' '.join(words[:idx])
-                return f"No manual action needed to {action}"
-
-    # Pattern: "Copy X when Y" -> "X are now copied automatically when Y"
-    if title_lower.startswith('copy '):
-        return f"{title} - no manual work needed"
-
-    # Pattern: "Improve X" -> "X now improved"
-    if title_lower.startswith('improve '):
-        feature = title[8:].strip()
-        return f"{feature[0].upper() + feature[1:]} now improved"
-
-    # Pattern: "Fix X" -> "X now fixed"
-    if title_lower.startswith('fix '):
-        issue = title[4:].strip()
-        return f"{issue[0].upper() + issue[1:]} now fixed"
-
-    # Pattern: "Add X" -> "X now available"
-    if title_lower.startswith('add '):
-        feature = title[4:].strip()
-        return f"{feature[0].upper() + feature[1:]} now available"
-
-    # Default: Return a generic benefit that's different from title
-    return "No manual action needed"
-
-
-def _make_benefit_statement(title: str) -> str:
-    """Convert a user-friendly title into a benefit statement."""
-    title_lower = title.lower()
-
-    # Handle "automatically" patterns - the title itself is the benefit
-    if 'automatically' in title_lower:
-        return title
-
-    # For specific patterns, create meaningful benefit statements
-    if 'cancel' in title_lower:
-        return "Expired subscriptions are now cancelled automatically"
-
-    if 'copy' in title_lower and 'attachment' in title_lower:
-        return "Attachments are now copied when converting"
-
-    if 'copy' in title_lower:
-        return "Items are now copied automatically"
-
-    # If title starts with a verb, create a benefit statement
-    verbs = ['cancel', 'copy', 'add', 'update', 'fix', 'delete', 'remove', 'create', 'edit', 'manage', 'view']
-    for verb in verbs:
-        if title_lower.startswith(verb):
-            # Convert verb to past tense and make it a benefit
-            past_tense = {
-                'cancel': 'cancelled', 'copy': 'copied', 'add': 'added', 'update': 'updated',
-                'fix': 'fixed', 'delete': 'deleted', 'remove': 'removed', 'create': 'created',
-                'edit': 'edited', 'manage': 'managed', 'view': 'now visible'
-            }
-            rest_of_title = title[len(verb):].strip()
-            if verb in past_tense:
-                return f"{rest_of_title[0].upper() + rest_of_title[1:] if rest_of_title else rest_of_title} {past_tense[verb]}"
-
-    # Default: Use the title itself (it's already user-friendly)
-    return title
 
 
 def categorize_pr(pr_branch: str, pr_title: str, pr_labels: list) -> str:
@@ -411,16 +355,6 @@ def categorize_pr(pr_branch: str, pr_title: str, pr_labels: list) -> str:
     return 'Other'
 
 
-def get_branch_name_from_refs(refs):
-    try:
-        for ref in refs:
-            if ref.ref:
-                return ref.ref
-    except:
-        pass
-    return ""
-
-
 def fetch_pr_commits(pr) -> dict:
     commits_text = ""
     try:
@@ -428,7 +362,7 @@ def fetch_pr_commits(pr) -> dict:
         for commit in commits:
             if commit.commit and commit.commit.message:
                 commits_text += commit.commit.message + "\n"
-    except:
+    except Exception:
         pass
     return {
         'number': pr.number,
@@ -451,7 +385,7 @@ def fetch_merged_prs(repo, start_date: datetime, end_date: datetime) -> list[dic
             if pr.merged_at and start_date <= pr.merged_at.replace(tzinfo=None) <= end_date:
                 matching_prs.append(pr)
         print(f"Found {len(matching_prs)} merged PRs. Fetching commits in parallel...")
-        
+
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(fetch_pr_commits, pr): pr for pr in matching_prs}
             for i, future in enumerate(as_completed(futures)):
@@ -478,13 +412,15 @@ def group_by_ticket(prs: list[dict]) -> dict:
 
 
 def extract_key_terms(text: str) -> set[str]:
-    stopwords = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-                 'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
-                 'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 
-                 'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 
-                 'those', 'i', 'we', 'you', 'they', 'he', 'she', 'it', 'my', 'our',
-                 'your', 'their', 'its', 'add', 'added', 'support', 'feature', 'new',
-                 'using', 'also', 'now', 'updated', 'update', 'fix', 'fixed', 'bug'}
+    stopwords = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+        'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+        'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+        'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these',
+        'those', 'i', 'we', 'you', 'they', 'he', 'she', 'it', 'my', 'our',
+        'your', 'their', 'its', 'add', 'added', 'support', 'feature', 'new',
+        'using', 'also', 'now', 'updated', 'update', 'fix', 'fixed', 'bug',
+    }
     if not text:
         return set()
     words = re.findall(r'[a-z]{3,}', text.lower())
@@ -501,18 +437,18 @@ def group_by_title_similarity(entries: list[dict]) -> list[list[dict]]:
     def is_duplicate(entry1: dict, entry2: dict) -> bool:
         title1 = re.sub(r'[^a-z0-9]', '', entry1['title'].lower().strip())
         title2 = re.sub(r'[^a-z0-9]', '', entry2['title'].lower().strip())
-        
+
         if title1 == title2 or title1 in title2 or title2 in title1:
             return True
-        
+
         terms1 = extract_key_terms(entry1.get('summary', '') + ' ' + entry1.get('title', ''))
         terms2 = extract_key_terms(entry2.get('summary', '') + ' ' + entry2.get('title', ''))
-        
+
         if len(terms1) >= 3 and len(terms2) >= 3:
             common = terms1 & terms2
             if len(common) >= 3:
                 return True
-        
+
         return False
 
     for i, entry in enumerate(entries):
@@ -525,7 +461,6 @@ def group_by_title_similarity(entries: list[dict]) -> list[list[dict]]:
         for j, other in enumerate(entries):
             if j in used:
                 continue
-
             if is_duplicate(entry, other):
                 group.append(other)
                 used.add(j)
@@ -535,10 +470,21 @@ def group_by_title_similarity(entries: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def process_single_pr(pr: dict, llm_api_url: Optional[str], llm_api_key: Optional[str]) -> dict:
-    summary = generate_summary(pr['title'], pr['body'], pr.get('commits', ''), llm_api_url, llm_api_key)
-    category = categorize_pr(pr['branch'], pr['title'], pr['labels'])
+def process_single_pr(
+    pr: dict,
+    llm_api_url: Optional[str],
+    llm_api_key: Optional[str],
+) -> dict:
     friendly_title = make_user_friendly_title(pr['title'], llm_api_url, llm_api_key)
+    summary = generate_summary(
+        pr['title'],
+        pr['body'],
+        pr.get('commits', ''),
+        llm_api_url,
+        llm_api_key,
+        friendly_title=friendly_title,
+    )
+    category = categorize_pr(pr['branch'], pr['title'], pr['labels'])
     return {
         'title': pr['title'],
         'friendly_title': friendly_title,
@@ -548,7 +494,12 @@ def process_single_pr(pr: dict, llm_api_url: Optional[str], llm_api_key: Optiona
     }
 
 
-def process_prs(fe_prs: list[dict], be_prs: list[dict], llm_api_url: Optional[str] = None, llm_api_key: Optional[str] = None) -> dict:
+def process_prs(
+    fe_prs: list[dict],
+    be_prs: list[dict],
+    llm_api_url: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
+) -> dict:
     print("Processing PRs...")
     all_prs = []
     for pr in fe_prs + be_prs:
@@ -565,14 +516,14 @@ def process_prs(fe_prs: list[dict], be_prs: list[dict], llm_api_url: Optional[st
     for ticket_id, pr_group in ticket_grouped.items():
         combined_title = pr_group[0]['title']
         title_key = re.sub(r'[^a-z0-9]', '', combined_title.lower().strip())
-        
+
         if title_key in seen_titles:
             continue
         seen_titles.add(title_key)
-        
+
         merged_commits = "\n".join([p.get('commits', '') for p in pr_group if p.get('commits')])
         merged_body = " | ".join([p.get('body', '') for p in pr_group if p.get('body')])
-        
+
         entries_to_process.append({
             'title': combined_title,
             'body': merged_body,
@@ -582,10 +533,13 @@ def process_prs(fe_prs: list[dict], be_prs: list[dict], llm_api_url: Optional[st
             'prs': pr_group,
         })
 
-    print(f"Generating summaries for {len(entries_to_process)} entries using LLM...")
+    print(f"Generating summaries for {len(entries_to_process)} entries...")
     if llm_api_key and llm_api_url:
         with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(process_single_pr, pr, llm_api_url, llm_api_key): pr for pr in entries_to_process}
+            futures = {
+                executor.submit(process_single_pr, pr, llm_api_url, llm_api_key): pr
+                for pr in entries_to_process
+            }
             for i, future in enumerate(as_completed(futures)):
                 entry = future.result()
                 result[entry['category']].append(entry)
@@ -598,38 +552,72 @@ def process_prs(fe_prs: list[dict], be_prs: list[dict], llm_api_url: Optional[st
     for category in result:
         result[category] = group_by_title_similarity(result[category])
 
-    filtered_result = {k: v for k, v in result.items() if k != 'Other'}
-    
-    return filtered_result
+    # Drop 'Other' category from output
+    return {k: v for k, v in result.items() if k != 'Other'}
 
 
-def format_release_message(grouped_prs: dict, week_start: datetime, week_end: datetime) -> str:
-    week_str = f"{week_start.strftime('%Y-%m-%d')} to {week_end.strftime('%Y-%m-%d')}"
-    message = f"## 📢 Weekly Release Notes ({week_str})\n\n"
+def format_release_message(
+    grouped_prs: dict,
+    week_start: datetime,
+    week_end: datetime,
+) -> str:
+    week_label = f"week of {week_start.strftime('%B')} {week_start.day}, {week_start.year}"
 
-    category_order = ['New Features', 'Bug Fixes', 'Improvements']
-    category_labels = {
-        'New Features': '✨ What\'s New',
-        'Bug Fixes': '🐛 Fixed',
-        'Improvements': '⚡ Improvements'
-    }
+    # Count totals for teaser
+    counts = {cat: len(grouped_prs.get(cat, [])) for cat in ['New Features', 'Bug Fixes', 'Improvements']}
 
-    for category in category_order:
-        items = grouped_prs.get(category, [])
+    teaser_parts = []
+    if counts['New Features']:
+        n = counts['New Features']
+        teaser_parts.append(f"{n} new feature{'s' if n > 1 else ''}")
+    if counts['Bug Fixes']:
+        n = counts['Bug Fixes']
+        teaser_parts.append(f"{n} bug fix{'es' if n > 1 else ''}")
+    if counts['Improvements']:
+        n = counts['Improvements']
+        teaser_parts.append(f"{n} improvement{'s' if n > 1 else ''}")
+
+    if len(teaser_parts) > 1:
+        teaser = ", ".join(teaser_parts[:-1]) + f", and {teaser_parts[-1]}"
+    elif teaser_parts:
+        teaser = teaser_parts[0]
+    else:
+        teaser = "updates"
+
+    message = f"## Release notes — {week_label}\n\n"
+    message += f"> {teaser.capitalize()} shipped this week.\n\n"
+    message += "---\n\n"
+
+    category_config = [
+        ('New Features', 'New features'),
+        ('Bug Fixes',    'Bug fixes'),
+        ('Improvements', 'Improvements'),
+    ]
+
+    sections = []
+    for cat_key, cat_label in category_config:
+        items = grouped_prs.get(cat_key, [])
         if not items:
             continue
 
-        message += f"### {category_labels.get(category, category)}\n"
-
+        section = f"### {cat_label}\n\n"
         for group in items:
             entry = group[0]
-            friendly_title = entry.get('friendly_title', make_user_friendly_title(entry['title']))
+            friendly_title = entry.get('friendly_title') or make_user_friendly_title(entry['title'])
             summary = entry.get('summary', '').strip()
 
-            if summary and summary != friendly_title:
-                message += f"• **{friendly_title}**: {summary}\n\n"
+            if summary and summary.lower().strip('.') != friendly_title.lower().strip('.'):
+                section += f"- **{friendly_title}** — {summary}\n"
             else:
-                message += f"• **{friendly_title}**\n\n"
+                section += f"- **{friendly_title}**\n"
+
+        sections.append(section.rstrip('\n') + '\n')
+
+    message += "\n---\n\n".join(sections)
+    message += "\n---\n\n"
+
+    date_range = f"{week_start.strftime('%b')} {week_start.day}–{week_end.day}, {week_end.year}"
+    message += f"*Shipped: {date_range}*\n"
 
     return message
 
@@ -646,11 +634,11 @@ def run_generator(
         if progress_callback:
             progress_callback(msg)
         print(f"[PROGRESS] {msg}")
-    
+
     print("=" * 50)
     print("Starting release note generation...")
     print("=" * 50)
-    
+
     progress("Connecting to GitHub...")
     g = Github(github_token)
 
@@ -683,9 +671,9 @@ def run_generator(
     print("\n" + "=" * 50)
     print("Release note generation complete!")
     print("=" * 50)
-    
+
     progress("Done!")
-    
+
     return message
 
 
@@ -699,7 +687,7 @@ if __name__ == "__main__":
     llm_url = os.environ.get("LLM_API_URL", "")
 
     if not token or not fe_repo or not be_repo:
-        print("Missing required environment variables")
+        print("Missing required environment variables: GITHUB_TOKEN, FE_REPO, BE_REPO")
         sys.exit(1)
 
     message = run_generator(token, fe_repo, be_repo, llm_key, llm_url)
