@@ -152,7 +152,7 @@ def send_to_keila(markdown_content, subject):
     html_body = markdown.markdown(markdown_content)
 
     text_body = f"""
-<img src="https://agencyhandy.com/logo.png" width="150" alt="AgencyHandy"/>
+<img src="https://i.postimg.cc/VvpKzkfn/Handy-Logo.jpg" width="150" alt="AgencyHandy"/>
 
 ---
 {html_body}
