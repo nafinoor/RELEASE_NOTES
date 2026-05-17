@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime
 from flask import Flask, jsonify, request, make_response, stream_with_context
 from dotenv import load_dotenv
@@ -7,6 +8,8 @@ from flask_cors import CORS, cross_origin
 import logging
 import queue
 import threading
+import requests as http_requests
+import markdown
 from pymongo import MongoClient
 
 load_dotenv()
@@ -130,6 +133,69 @@ def save_notes(data):
             )
         return
     save_to_file(data, RELEASE_NOTES_FILE)
+
+
+def send_to_keila(markdown_content, subject):
+    keila_api_key = os.environ.get("KEILA_API_KEY", "")
+    keila_url = os.environ.get("KEILA_API_URL", "").rstrip("/")
+    sender_id = os.environ.get("KEILA_SENDER_ID", "")
+    segment_id = os.environ.get("KEILA_SEGMENT_ID", "")
+
+    if not keila_api_key or not keila_url or not sender_id or not segment_id:
+        raise ValueError("Keila configuration missing (KEILA_API_KEY, KEILA_API_URL, KEILA_SENDER_ID, KEILA_SEGMENT_ID)")
+
+    headers = {
+        "Authorization": f"Bearer {keila_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    html_body = markdown.markdown(markdown_content)
+
+    text_body = f"""
+<img src="https://agencyhandy.com/logo.png" width="150" alt="AgencyHandy"/>
+
+---
+{html_body}
+---
+
+You're receiving this because you're an AgencyHandy user.
+Unsubscribe: {{{{ unsubscribe_url }}}}
+"""
+
+    logger.info(f"Creating Keila campaign: {subject}")
+    campaign_resp = http_requests.post(
+        f"{keila_url}/api/v1/campaigns",
+        headers=headers,
+        json={
+            "data": {
+                "subject": subject,
+                "settings": {"type": "markdown"},
+                "text_body": text_body,
+                "sender_id": sender_id,
+                "segment_id": segment_id,
+            }
+        },
+        timeout=30,
+    )
+
+    if campaign_resp.status_code not in (200, 201):
+        raise RuntimeError(f"Keila campaign creation failed: {campaign_resp.status_code} {campaign_resp.text}")
+
+    campaign = campaign_resp.json()
+    campaign_id = campaign["data"]["id"]
+    logger.info(f"Campaign created: {campaign_id}")
+
+    send_resp = http_requests.post(
+        f"{keila_url}/api/v1/campaigns/{campaign_id}/actions/send",
+        headers=headers,
+        timeout=30,
+    )
+
+    if send_resp.status_code not in (200, 202):
+        raise RuntimeError(f"Keila campaign send failed: {send_resp.status_code} {send_resp.text}")
+
+    logger.info(f"Campaign sent: {campaign_id}")
+    return campaign_id
 
 
 def generate_progress():
@@ -347,6 +413,40 @@ def admin_generate_release_note():
         return jsonify({"data": result})
     except Exception as e:
         logger.error(f"Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/v1/admin/release-notes/send-to-keila', methods=['POST'])
+def admin_send_release_note_to_keila():
+    data = request.get_json() or {}
+    password = data.get("password", "")
+    week_start = data.get("week_start", "")
+
+    if password != ADMIN_PASSWORD:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    if not week_start:
+        return jsonify({"error": "Missing week_start"}), 400
+
+    all_notes = load_notes()
+    note = all_notes.get(week_start)
+    if not note:
+        return jsonify({"error": "Release note not found for this week"}), 404
+
+    content = note.get("content", "")
+    if not content or content.strip() in ("", "no release note"):
+        return jsonify({"error": "Release note content is empty"}), 400
+
+    first_line = content.strip().split("\n")[0]
+    subject = re.sub(r"^#+\s*", "", first_line).strip()
+    if not subject:
+        subject = f"Release Notes — {week_start}"
+
+    try:
+        campaign_id = send_to_keila(content, subject)
+        return jsonify({"success": True, "campaign_id": campaign_id, "subject": subject})
+    except Exception as e:
+        logger.error(f"Failed to send to Keila: {e}")
         return jsonify({"error": str(e)}), 500
 
 
