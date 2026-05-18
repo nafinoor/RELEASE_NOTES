@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from flask import Flask, jsonify, request, make_response, stream_with_context
 from dotenv import load_dotenv
@@ -43,6 +44,15 @@ def get_mongo_collection():
         else:
             logger.warning("MONGO_URI not set. Using file fallback.")
     return mongo_collection
+
+
+def get_db():
+    global mongo_client
+    if mongo_client is None:
+        get_mongo_collection()
+    if mongo_client is None:
+        return None
+    return mongo_client[MONGO_DB]
 
 
 app = Flask(__name__)
@@ -196,6 +206,94 @@ Unsubscribe: {{{{ unsubscribe_url }}}}
 
     logger.info(f"Campaign sent: {campaign_id}")
     return campaign_id
+
+
+def sync_super_admin_contacts_to_keila():
+    keila_api_key = os.environ.get("KEILA_API_KEY", "")
+    keila_url = os.environ.get("KEILA_API_URL", "").rstrip("/")
+
+    if not keila_api_key or not keila_url:
+        raise ValueError("Keila configuration missing (KEILA_API_KEY, KEILA_API_URL)")
+
+    db = get_db()
+    if db is None:
+        raise RuntimeError("MongoDB not connected")
+
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "companyroles",
+                "localField": "role",
+                "foreignField": "_id",
+                "as": "companyRoleData",
+            }
+        },
+        {"$unwind": "$companyRoleData"},
+        {
+            "$lookup": {
+                "from": "roles",
+                "localField": "companyRoleData.role",
+                "foreignField": "_id",
+                "as": "roleData",
+            }
+        },
+        {"$unwind": "$roleData"},
+        {"$match": {"roleData.name": "superAdmin"}},
+        {"$group": {"_id": "$email", "firstName": {"$first": "$firstName"}, "lastName": {"$first": "$lastName"}}},
+        {"$project": {"email": "$_id", "firstName": 1, "lastName": 1, "_id": 0}},
+    ]
+    members = list(db.members.aggregate(pipeline))
+
+    headers = {
+        "Authorization": f"Bearer {keila_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    results = {"total": len(members), "created": 0, "skipped": 0, "errors": []}
+    lock = threading.Lock()
+
+    def create_contact(member):
+        first = member.get("firstName") or ""
+        last = member.get("lastName") or ""
+        payload = {
+            "data": {
+                "email": member["email"],
+                "first_name": first,
+                "last_name": last,
+                "data": {"source": "test_db"},
+            }
+        }
+        try:
+            resp = http_requests.post(
+                f"{keila_url}/api/v1/contacts",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                with lock:
+                    results["created"] += 1
+                logger.info(f"Created Keila contact: {member['email']}")
+            elif resp.status_code in (422, 400) and "already been taken" in resp.text:
+                with lock:
+                    results["skipped"] += 1
+                logger.info(f"Contact already exists (skipped): {member['email']}")
+            else:
+                err_msg = f"{resp.status_code}: {resp.text[:200]}"
+                with lock:
+                    results["errors"].append({"email": member["email"], "error": err_msg})
+                logger.warning(f"Failed to create contact {member['email']}: {err_msg}")
+        except Exception as e:
+            with lock:
+                results["errors"].append({"email": member["email"], "error": str(e)})
+            logger.warning(f"Error creating contact {member['email']}: {e}")
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = [executor.submit(create_contact, m) for m in members]
+        for future in as_completed(futures):
+            future.result()
+
+    return results
 
 
 def generate_progress():
@@ -452,6 +550,59 @@ def admin_send_release_note_to_keila():
     except Exception as e:
         logger.error(f"Failed to send to Keila: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+sync_tasks = {}
+sync_tasks_lock = threading.Lock()
+
+
+@app.route('/api/v1/admin/keila/sync-contacts', methods=['POST'])
+def admin_sync_keila_contacts():
+    data = request.get_json() or {}
+    password = data.get("password", "")
+
+    if not is_admin_password(password):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    task_id = os.urandom(8).hex()
+    task = {"status": "running", "results": None, "error": None}
+
+    with sync_tasks_lock:
+        sync_tasks[task_id] = task
+
+    def run_sync():
+        try:
+            results = sync_super_admin_contacts_to_keila()
+            with sync_tasks_lock:
+                task["status"] = "done"
+                task["results"] = results
+        except Exception as e:
+            logger.error(f"Keila contact sync failed: {e}")
+            with sync_tasks_lock:
+                task["status"] = "error"
+                task["error"] = str(e)
+
+    thread = threading.Thread(target=run_sync, daemon=True)
+    thread.start()
+
+    return jsonify({"success": True, "task_id": task_id}), 202
+
+
+@app.route('/api/v1/admin/keila/sync-status/<task_id>', methods=['GET'])
+def admin_sync_keila_status(task_id):
+    with sync_tasks_lock:
+        task = sync_tasks.get(task_id)
+
+    if task is None:
+        return jsonify({"error": "Task not found"}), 404
+
+    response = {"status": task["status"]}
+    if task["results"] is not None:
+        response["results"] = task["results"]
+    if task["error"] is not None:
+        response["error"] = task["error"]
+
+    return jsonify(response)
 
 
 if __name__ == "__main__":
